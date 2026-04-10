@@ -9,9 +9,13 @@ SCREEN_HEIGHT = 1000
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Donkey Kong Style - גרסה ללא ירידה בסולמות")
 clock = pygame.time.Clock()
+image_ladder = pygame.image.load("Ladder-removebg-preview.png").convert()
+image_ladder = pygame.transform.scale(image_ladder,(50,200))
+
+
 
 # 🎨 צבעים
-BG_COLOR = (20, 20, 20)
+BG_COLOR = (0, 0, 0)
 RED = (200, 50, 50)
 BLUE = (50, 150, 255)
 ORANGE = (255, 140, 0)
@@ -39,7 +43,7 @@ class Player:
     def __init__(self, x, y):
         self.size = (50, 50)
         try:
-            self.image = pygame.image.load("Player1.png")
+            self.image = pygame.image.load("Player1-removebg-preview (1).png").convert()
             self.image = pygame.transform.scale(self.image, self.size)
         except:
             self.image = pygame.Surface(self.size)
@@ -112,7 +116,7 @@ class Player:
 class Barrel:
     def __init__(self, x, y):
         self.rect = pygame.Rect(x, y, 30, 30)
-        self.speed_x = 4  # המהירות שבה היא מתגלגלת
+        self.speed_x = 8  # המהירות שבה היא מתגלגלת
         self.velocity_y = 0
         self.gravity = 0.6
 
@@ -187,7 +191,7 @@ while running:
     for p in platforms:
         pygame.draw.rect(screen, RED, p)
     for l in ladders:
-        pygame.draw.rect(screen, BLUE, l)
+        screen.blit(image_ladder, (l[0],l[1]))
     for barrel in barrels:
         barrel.draw(screen)
     player.draw(screen)
