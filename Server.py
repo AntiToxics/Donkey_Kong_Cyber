@@ -1,201 +1,278 @@
-import pygame
+import socket
+import pickle
 import random
+import threading
+import struct
+import time
+import logging
 
-pygame.init()
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler("server.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# 📺 הגדרות מסך
-SCREEN_WIDTH = 1000
-SCREEN_HEIGHT = 1000
-screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Donkey Kong Style - גרסה ללא ירידה בסולמות")
-clock = pygame.time.Clock()
-image_ladder = pygame.image.load("Ladder-removebg-preview.png").convert()
-image_ladder = pygame.transform.scale(image_ladder,(50,200))
+# ==================== Constants ====================
+PORT = 5555
+FRAME_RATE = 1 / 60
 
-
-
-# 🎨 צבעים
-BG_COLOR = (0, 0, 0)
-RED = (200, 50, 50)
-BLUE = (50, 150, 255)
-ORANGE = (255, 140, 0)
-
-# 🧱 פלטפורמות (עם רווחים בקצוות כדי שהחביות ייפלו לקומה הבאה)
-platforms = [
-    pygame.Rect(0, 900, 1000, 10),  # רצפה תחתונה
-    pygame.Rect(100, 700, 900, 10),  # חור בצד שמאל
-    pygame.Rect(0, 500, 900, 10),  # חור בצד ימין
-    pygame.Rect(100, 300, 900, 10),  # חור בצד שמאל
-    pygame.Rect(0, 100, 600, 10),  # פלטפורמה עליונה
+PLATFORMS = [
+    (0,   900, 1000, 10),
+    (100, 700,  900, 10),
+    (0,   500,  900, 10),
+    (100, 300,  900, 10),
+    (0,   100,  600, 10),
+]
+LADDERS = [
+    (850, 700, 50, 200),
+    (150, 500, 50, 200),
+    (750, 300, 50, 200),
 ]
 
-# 🪜 סולמות
-ladders = [
-    pygame.Rect(850, 700, 50, 200),
-    pygame.Rect(150, 500, 50, 200),
-    pygame.Rect(750, 300, 50, 200),
-    pygame.Rect(500, 100, 50, 200),
-]
+ACTION_KEYS = {"left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN", "jump": "SPACE"}
 
+# ==================== Network Helpers ====================
+def send_message(connection, data):
+    """Sends data with a 4-byte size prefix so the packet never breaks"""
+    raw_bytes = pickle.dumps(data)
+    size_prefix = struct.pack(">I", len(raw_bytes))
+    connection.sendall(size_prefix + raw_bytes)
 
-# 🧍 מחלקת שחקן
-class Player:
-    def __init__(self, x, y):
-        self.size = (50, 50)
+def receive_message(connection):
+    """Receives a full message by first reading the 4-byte size prefix"""
+    size_bytes = receive_exact_bytes(connection, 4)
+    if not size_bytes:
+        return None
+    message_length = struct.unpack(">I", size_bytes)[0]
+    raw_bytes = receive_exact_bytes(connection, message_length)
+    return pickle.loads(raw_bytes) if raw_bytes else None
+
+def receive_exact_bytes(connection, num_bytes):
+    """Keeps reading from the socket until we have exactly num_bytes"""
+    buffer = b""
+    while len(buffer) < num_bytes:
+        chunk = connection.recv(num_bytes - len(buffer))
+        if not chunk:
+            return None
+        buffer += chunk
+    return buffer
+
+# ==================== Setup Network ====================
+def setup_network():
+    """Opens the server and waits for both players to connect"""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("0.0.0.0", PORT))
+    server_socket.listen(2)
+    logging.info(f"Server started on port {PORT}")
+
+    logging.info("Waiting for Player 1...")
+    player1_conn, player1_addr = server_socket.accept()
+    send_message(player1_conn, {"player_num": 1})
+    logging.info(f"Player 1 connected from {player1_addr}")
+
+    logging.info("Waiting for Player 2...")
+    player2_conn, player2_addr = server_socket.accept()
+    send_message(player2_conn, {"player_num": 2})
+    logging.info(f"Player 2 connected from {player2_addr}")
+
+    return server_socket, player1_conn, player2_conn
+
+# ==================== Client Thread ====================
+def handle_player_input(connection, player_number, keys_store, keys_lock, restart_votes):
+    """
+    Runs in a background thread for each player.
+    Receives key presses and stores them in keys_store.
+    """
+    while True:
         try:
-            self.image = pygame.image.load("Player1-removebg-preview (1).png").convert()
-            self.image = pygame.transform.scale(self.image, self.size)
-        except:
-            self.image = pygame.Surface(self.size)
-            self.image.fill((0, 255, 0))
+            received_keys = receive_message(connection)
+            if received_keys is None:
+                break
+            if received_keys.get("restart"):
+                with keys_lock:
+                    restart_votes.add(player_number)
+                logging.debug(f"Player {player_number} voted to restart")
+            else:
+                with keys_lock:
+                    keys_store[player_number] = received_keys
+        except Exception as e:
+            logging.error(f"Error receiving from Player {player_number}: {e}")
+            break
+    logging.warning(f"Player {player_number} disconnected")
 
-        self.start_x = x
-        self.start_y = y
-        self.x = x
-        self.y = y
+# ==================== Game Classes ====================
+class Player:
+    def __init__(self, start_x, start_y, action_keys):
+        self.x = float(start_x)
+        self.y = float(start_y)
+        self.vertical_velocity = 0.0
+        self.is_jumping = False
+        self.won = False
+        self.action_keys = action_keys
 
-        self.speed = 5
-        self.velocity_y = 0
-        self.gravity = 0.6
-        self.jump_power = -12
-        self.on_ground = False
+    def is_colliding_with(self, rect_x, rect_y, rect_width, rect_height):
+        return (self.x < rect_x + rect_width and self.x + 50 > rect_x and
+                self.y < rect_y + rect_height and self.y + 50 > rect_y)
 
-    def get_rect(self):
-        return pygame.Rect(self.x, self.y, *self.size)
+    def update(self, pressed_keys):
+        if not pressed_keys:
+            return
 
-    def reset_position(self):
-        self.x = self.start_x
-        self.y = self.start_y
-        self.velocity_y = 0
+        keys = self.action_keys
+        on_ladder = any(self.is_colliding_with(*ladder) for ladder in LADDERS)
 
-    def move(self, keys, platforms, ladders):
-        rect = self.get_rect()
-        on_ladder = any(rect.colliderect(l) for l in ladders)
+        if pressed_keys.get(keys["left"]):
+            self.x -= 5
+        if pressed_keys.get(keys["right"]):
+            self.x += 5
 
-        # תנועה אופקית
-        if keys[pygame.K_LEFT]:
-            self.x -= self.speed
-        if keys[pygame.K_RIGHT]:
-            self.x += self.speed
-
-        # קפיצה
-        if keys[pygame.K_SPACE] and self.on_ground:
-            self.velocity_y = self.jump_power
-
-        # לוגיקת סולמות
-        if on_ladder:
-            self.velocity_y = 0
-            if keys[pygame.K_UP]: self.y -= 5
-            if keys[pygame.K_DOWN]: self.y += 5
+        if on_ladder and (pressed_keys.get(keys["up"]) or pressed_keys.get(keys["down"])):
+            self.vertical_velocity = 0
+            if pressed_keys.get(keys["up"]):
+                self.y -= 5
+            if pressed_keys.get(keys["down"]):
+                self.y += 5
         else:
-            self.velocity_y += self.gravity
+            self.vertical_velocity += 0.8
+            self.y += self.vertical_velocity
+            on_ground = False
+            for (px, py, pw, ph) in PLATFORMS:
+                if self.is_colliding_with(px, py, pw, ph) and self.vertical_velocity > 0:
+                    self.y = py - 50
+                    self.vertical_velocity = 0
+                    on_ground = True
+                    self.is_jumping = False
 
-        self.y += self.velocity_y
+            if pressed_keys.get(keys["jump"]) and on_ground and not self.is_jumping:
+                self.vertical_velocity = -14
+                self.is_jumping = True
 
-        # בדיקת התנגשות עם פלטפורמות
-        rect = self.get_rect()
-        self.on_ground = False
-        for p in platforms:
-            if rect.colliderect(p):
-                if self.velocity_y > 0:  # נופל מלמעלה
-                    self.y = p.top - self.size[1]
-                    self.velocity_y = 0
-                    self.on_ground = True
-                elif self.velocity_y < 0:  # קופץ מלמטה
-                    self.y = p.bottom
-                    self.velocity_y = 0
+        self.x = max(0, min(self.x, 950))
 
-        # גבולות מסך
-        self.x = max(0, min(self.x, SCREEN_WIDTH - self.size[0]))
-
-    def draw(self, screen):
-        screen.blit(self.image, (self.x, self.y))
+        if self.x <= 150 and 250 <= self.y <= 350:
+            self.won = True
 
 
-# 🛢️ מחלקת חבית (ללא ירידה בסולמות)
 class Barrel:
-    def __init__(self, x, y):
-        self.rect = pygame.Rect(x, y, 30, 30)
-        self.speed_x = 8  # המהירות שבה היא מתגלגלת
-        self.velocity_y = 0
-        self.gravity = 0.6
+    def __init__(self):
+        self.x = float(random.randint(200, 250))
+        self.y = 50.0
+        self.horizontal_speed = random.choice([-4.0, 4.0])
 
-    def update(self, platforms):
-        # הפעלת כבידה תמידית (כדי שתיפול ברווחים)
-        self.velocity_y += self.gravity
-        self.rect.y += self.velocity_y
+    def is_hitting_player(self, player):
+        return (player.x < self.x + 30 and player.x + 50 > self.x and
+                player.y < self.y + 30 and player.y + 50 > self.y)
 
-        # בדיקת התנגשות עם פלטפורמות - עוצרת את הנפילה
-        for p in platforms:
-            if self.rect.colliderect(p):
-                if self.velocity_y > 0:
-                    self.rect.bottom = p.top
-                    self.velocity_y = 0
+    def update(self):
+        self.y += 4
+        self.x += self.horizontal_speed
+        for (px, py, pw, ph) in PLATFORMS:
+            if (self.x < px + pw and self.x + 30 > px and
+                    self.y < py + ph and self.y + 30 > py):
+                self.y = py - 30
+        if self.x + 30 >= 1000 or self.x <= 0:
+            self.horizontal_speed *= -1
 
-        # תנועה קדימה
-        self.rect.x += self.speed_x
+# ==================== Game Loop ====================
+def game_loop(player1_conn, player2_conn, keys_store, keys_lock, restart_votes):
+    """Main loop — updates physics, checks collisions, sends game state to both clients"""
+    player1 = Player(50,  850, ACTION_KEYS)
+    player2 = Player(150, 850, ACTION_KEYS)
+    barrels = []
+    winner_message = ""
 
-        # אם פגעה בקיר - משנה כיוון
-        if self.rect.right >= SCREEN_WIDTH or self.rect.left <= 0:
-            self.speed_x *= -1
+    while True:
+        frame_start = time.time()
 
-    def draw(self, screen):
-        pygame.draw.circle(screen, ORANGE, self.rect.center, 15)
-        # קו שמראה שהיא מתגלגלת
-        pygame.draw.line(screen, (0, 0, 0), self.rect.center, (self.rect.centerx, self.rect.top), 2)
+        with keys_lock:
+            if len(restart_votes) == 2:
+                player1 = Player(50,  850, ACTION_KEYS)
+                player2 = Player(150, 850, ACTION_KEYS)
+                barrels = []
+                winner_message = ""
+                restart_votes.clear()
+                logging.info("Game restarted by both players")
 
+        if not winner_message:
+            with keys_lock:
+                player1_keys = dict(keys_store.get(1, {}))
+                player2_keys = dict(keys_store.get(2, {}))
 
-# --- אובייקטים וטיימרים ---
-player = Player(50, 850)
-barrels = []
+            player1.update(player1_keys)
+            player2.update(player2_keys)
 
-# יצירת חבית כל 2.5 שניות
-SPAWN_BARREL = pygame.USEREVENT + 1
-pygame.time.set_timer(SPAWN_BARREL, 2500)
+            if random.random() < 0.01:
+                barrels.append(Barrel())
+                logging.debug(f"New barrel spawned — total barrels: {len(barrels)}")
 
-# 🎮 לולאה ראשית
-running = True
-while running:
-    clock.tick(60)
+            for barrel in barrels[:]:
+                barrel.update()
+                if barrel.is_hitting_player(player1):
+                    winner_message = "Player 2 Wins! (P1 Hit)"
+                    logging.info("Player 1 was hit by a barrel — Player 2 wins!")
+                if barrel.is_hitting_player(player2):
+                    winner_message = "Player 1 Wins! (P2 Hit)"
+                    logging.info("Player 2 was hit by a barrel — Player 1 wins!")
+                if barrel.y > 1000:
+                    barrels.remove(barrel)
 
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == SPAWN_BARREL:
-            barrels.append(Barrel(50, 50))  # נוצרת ליד הקוף למעלה
+            if player1.won:
+                winner_message = "Player 1 Wins!"
+                logging.info("Player 1 reached the goal and won!")
+            if player2.won:
+                winner_message = "Player 2 Wins!"
+                logging.info("Player 2 reached the goal and won!")
 
-    keys = pygame.key.get_pressed()
-    player.move(keys, platforms, ladders)
+        game_state = {
+            "p1":      (player1.x, player1.y),
+            "p2":      (player2.x, player2.y),
+            "barrels": [(barrel.x, barrel.y) for barrel in barrels],
+            "winner":  winner_message,
+        }
 
-    # עדכון חביות
-    for barrel in barrels[:]:
-        barrel.update(platforms)
-
-        # התנגשות בשחקן
-        if barrel.rect.colliderect(player.get_rect()):
-            player.reset_position()
-            barrels.clear()  # ניקוי חביות אחרי פסילה
+        try:
+            send_message(player1_conn, game_state)
+            send_message(player2_conn, game_state)
+        except Exception as e:
+            logging.error(f"Failed to send game state: {e}")
             break
 
-        # היעלמות בנקודת הסיום (למטה בצד שמאל)
-        if barrel.rect.y >= 850 and barrel.rect.x < 30:
-            barrels.remove(barrel)
-            continue
+        elapsed_time = time.time() - frame_start
+        time.sleep(max(0, FRAME_RATE - elapsed_time))
 
-        # הגנה מפני חביות שבורחות מהמסך
-        if barrel.rect.top > SCREEN_HEIGHT:
-            barrels.remove(barrel)
+# ==================== Main ====================
+def main():
+    server_socket, player1_conn, player2_conn = setup_network()
 
-    # 🎨 ציור
-    screen.fill(BG_COLOR)
-    for p in platforms:
-        pygame.draw.rect(screen, RED, p)
-    for l in ladders:
-        screen.blit(image_ladder, (l[0],l[1]))
-    for barrel in barrels:
-        barrel.draw(screen)
-    player.draw(screen)
+    keys_store = {}
+    keys_lock = threading.Lock()
+    restart_votes = set()
 
-    pygame.display.update()
+    threading.Thread(target=handle_player_input, args=(player1_conn, 1, keys_store, keys_lock, restart_votes), daemon=True).start()
+    threading.Thread(target=handle_player_input, args=(player2_conn, 2, keys_store, keys_lock, restart_votes), daemon=True).start()
 
-pygame.quit()
+    logging.info("Both players connected! Starting game...")
+
+    game_loop(player1_conn, player2_conn, keys_store, keys_lock, restart_votes)
+
+    server_socket.close()
+    logging.info("Server closed.")
+
+if __name__ == "__main__":
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.FileHandler("server.log"),
+            logging.StreamHandler()
+        ]
+    )
+    
+    main()
